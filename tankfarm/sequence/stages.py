@@ -1,0 +1,31 @@
+"""Stage names, their order and the gate each one demands."""
+
+from __future__ import annotations
+
+STAGE_IDLE = "idle"
+STAGE_VALVES_PERSISTED = "valves-persisted"
+STAGE_NEW_TANK_OPEN = "new-tank-open"
+STAGE_OLD_TANK_CLOSED = "old-tank-closed"
+STAGE_PUMP_RUNNING = "pump-running"
+
+STAGE_ORDER = (
+    STAGE_IDLE,
+    STAGE_VALVES_PERSISTED,
+    STAGE_NEW_TANK_OPEN,
+    STAGE_OLD_TANK_CLOSED,
+    STAGE_PUMP_RUNNING,
+)
+
+FACT_VALVE_PERSISTED = "valve.persisted"
+FACT_NEW_TANK_OPEN = "new_tank.open"
+FACT_OLD_TANK_CLOSED = "old_tank.closed"
+
+FACTS = (FACT_VALVE_PERSISTED, FACT_NEW_TANK_OPEN, FACT_OLD_TANK_CLOSED)
+
+STAGE_GATES = {
+    STAGE_VALVES_PERSISTED: (),
+    STAGE_NEW_TANK_OPEN: (FACT_VALVE_PERSISTED,),
+    STAGE_OLD_TANK_CLOSED: (FACT_NEW_TANK_OPEN,),
+    STAGE_PUMP_RUNNING: (FACT_VALVE_PERSISTED, FACT_OLD_TANK_CLOSED),
+}
+
