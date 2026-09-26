@@ -18,6 +18,7 @@ from tankfarm.domain import (
 from tankfarm.errors import (
     GateBlockedError,
     GaugeNotConfirmedError,
+    OutOfOrderError,
     StageAlreadyReachedError,
 )
 from tankfarm.esd.test import TestController
@@ -66,8 +67,6 @@ from tankfarm.pump.start import start_pump
 from tankfarm.pump.stop import stop_all_pumps, stop_pump
 from tankfarm.sequence.machine import SequenceMachine
 from tankfarm.sequence.stages import (
-    FACT_NEW_TANK_OPEN,
-    FACT_OLD_TANK_CLOSED,
     FACT_VALVE_PERSISTED,
     STAGE_NEW_TANK_OPEN,
     STAGE_OLD_TANK_CLOSED,
@@ -158,6 +157,7 @@ class Services:
         self.engine = InterlockEngine(self.journal, self.bus, self.clock)
         self.batches = BatchRegistry()
         self.machine = SequenceMachine(self.journal, self.bus, self.clock)
+        self.journal.add_observer(self.machine.observe)
         self.interlock = TransferInterlock(
             self.levels, self.limits, self.baselines, self.generations, self.clock
         )
@@ -285,10 +285,18 @@ class Services:
     def history(self, watermark: int | None = None) -> dict[str, object]:
         limit = self.commits.watermark() if watermark is None else int(watermark)
         projection = self.project(limit)
+        state = projection.snapshot()
+        # The stage the run had actually earned at that watermark, re-derived
+        # from the records visible then (each step must show its credentials).
+        at_then = SequenceMachine(self.journal, self.bus, self.clock)
+        at_then.replay(
+            record for record in self.visible_records(limit) if record.seq <= limit
+        )
+        state["stage"] = at_then.stage()
         return {
             "watermark": limit,
             "current_watermark": self.commits.watermark(),
-            "state": projection.snapshot(),
+            "state": state,
         }
 
     def capture_snapshot(self) -> VersionedSnapshot:
@@ -314,8 +322,9 @@ class Services:
     # ------------------------------------------------------------- transfer
 
     def persist_valves(self) -> ConfirmationSheet:
+        # The VALVE_PERSISTED record (observed by the machine) is the
+        # credential; the stage follows it, never the other way round.
         sheet = self.persister.persist()
-        self.machine.set_fact(FACT_VALVE_PERSISTED, True)
         if self.machine.stage() == STAGE_IDLE:
             self.machine.advance(STAGE_VALVES_PERSISTED)
         self.commit()
@@ -332,10 +341,13 @@ class Services:
         return valve
 
     def start_pump(self, pump_id: str, sheet_id: str) -> dict[str, object]:
-        pump = self.pumps.get(pump_id)
-        self.machine.backfill(STAGE_PUMP_RUNNING)
+        # Verify every pre-condition before any side effect, so a rejected
+        # start leaves the sequence exactly where it stood.
+        self.machine.check(STAGE_PUMP_RUNNING)
         sheet, report = self.gate.verify(sheet_id, PROCESS_TANK)
+        pump = self.pumps.get(pump_id)
         start_pump(pump, self.journal, self.bus, self.clock)
+        self.machine.advance(STAGE_PUMP_RUNNING)
         self.commit()
         return {
             "pump_id": pump.pump_id,
@@ -374,13 +386,20 @@ class Services:
     def change_tank(self) -> dict[str, str]:
         if self.machine.stage() == STAGE_OLD_TANK_CLOSED:
             raise StageAlreadyReachedError(STAGE_OLD_TANK_CLOSED)
-        self.machine.backfill(STAGE_OLD_TANK_CLOSED)
+        # Open the new tank and only reach the stage the position record
+        # proves; then close the old tank and reach its stage the same way.
         self.handoff.open_new(SOURCE_TANK)
+        self.machine.advance(STAGE_NEW_TANK_OPEN)
         self.handoff.close_old(SOURCE_TANK, DESTINATION_TANK)
+        self.machine.advance(STAGE_OLD_TANK_CLOSED)
         self.commit()
         return {"new_tank_id": SOURCE_TANK, "old_tank_id": DESTINATION_TANK}
 
     def retry_change_tank(self) -> dict[str, object]:
+        # A retry is a repair of an in-flight handover; it cannot start from
+        # a point whose preceding stage never happened.
+        if self.machine.stage() == STAGE_IDLE:
+            raise GateBlockedError(FACT_VALVE_PERSISTED)
         steps = self.handoff.retry(SOURCE_TANK, DESTINATION_TANK)
         self.commit()
         return {"steps": list(steps)}
@@ -643,6 +662,9 @@ class Services:
         for name, active in self.projection.latches.items():
             self.engine.restore(name, active, self.projection.latch_reason.get(name, ""))
         self.batches.restore(dict(self.projection.batches))
+        # Rebuild the transfer machine from committed, non-rolled-back
+        # records: every stage it shows must carry its credentials here.
+        self.machine.replay(self.visible_records())
 
 
 def build_services(
