@@ -11,12 +11,15 @@ from tankfarm.config.schema import DEFAULT_SETTINGS, ConfigRevision, ControlSett
 from tankfarm.domain import (
     DESTINATION_TANK,
     HEADER_ID,
+    POSITION_CLOSED,
+    POSITION_OPEN,
     PROCESS_TANK,
     SOURCE_TANK,
     VALVE_INLET,
+    VALVE_TANK_NEW,
+    VALVE_TANK_OLD,
 )
 from tankfarm.errors import (
-    GateBlockedError,
     GaugeNotConfirmedError,
     StageAlreadyReachedError,
 )
@@ -83,13 +86,14 @@ from tankfarm.tank.registry import TankRegistry
 from tankfarm.tank.summary import TankSummary, build_summary
 from tankfarm.valve.header import Header
 from tankfarm.valve.model import Valve
-from tankfarm.valve.persist import ValvePersister
+from tankfarm.valve.persist import PERSIST_KEY, ValvePersister
 from tankfarm.valve.registry import ValveRegistry
 from tankfarm.valve.switch import ValveSwitcher
 from tankfarm.versioning import ExpiryPolicy
 from tankfarm.versioning.baseline import Baseline, BaselineBook
 from tankfarm.versioning.generation import (
     SCOPE_SNAPSHOT,
+    SCOPE_VALVE_PERSIST,
     SNAPSHOT_KEY,
     GenerationRegistry,
 )
@@ -157,7 +161,9 @@ class Services:
         self.esd_valve = EsdValve(self.switcher)
         self.engine = InterlockEngine(self.journal, self.bus, self.clock)
         self.batches = BatchRegistry()
-        self.machine = SequenceMachine(self.journal, self.bus, self.clock)
+        self.machine = SequenceMachine(
+            self.journal, self.bus, self.clock, self.sequence_evidence
+        )
         self.interlock = TransferInterlock(
             self.levels, self.limits, self.baselines, self.generations, self.clock
         )
@@ -315,7 +321,8 @@ class Services:
 
     def persist_valves(self) -> ConfirmationSheet:
         sheet = self.persister.persist()
-        self.machine.set_fact(FACT_VALVE_PERSISTED, True)
+        # The durable valve.persisted record is the credential itself; the
+        # stage is only entered once that evidence is in the stream.
         if self.machine.stage() == STAGE_IDLE:
             self.machine.advance(STAGE_VALVES_PERSISTED)
         self.commit()
@@ -333,9 +340,14 @@ class Services:
 
     def start_pump(self, pump_id: str, sheet_id: str) -> dict[str, object]:
         pump = self.pumps.get(pump_id)
-        self.machine.backfill(STAGE_PUMP_RUNNING)
+        # No jumping: the running stage is reachable only as the single
+        # next step, with the handover credentials already present.
+        self.machine.check(STAGE_PUMP_RUNNING)
+        # Validate the start gate before any state changes; a blocked start
+        # must not leave a stage record behind.
         sheet, report = self.gate.verify(sheet_id, PROCESS_TANK)
         start_pump(pump, self.journal, self.bus, self.clock)
+        self.machine.advance(STAGE_PUMP_RUNNING)
         self.commit()
         return {
             "pump_id": pump.pump_id,
@@ -372,15 +384,23 @@ class Services:
         }
 
     def change_tank(self) -> dict[str, str]:
+        # Refuse the request before any valve moves; a repeat call or a
+        # missing persist credential must leave no record behind.
         if self.machine.stage() == STAGE_OLD_TANK_CLOSED:
             raise StageAlreadyReachedError(STAGE_OLD_TANK_CLOSED)
-        self.machine.backfill(STAGE_OLD_TANK_CLOSED)
+        self.machine.check(STAGE_NEW_TANK_OPEN)
+        # Each stage is taken only after the physical credential of the
+        # previous one is in the record stream; the machine refuses jumps.
         self.handoff.open_new(SOURCE_TANK)
+        self.machine.advance(STAGE_NEW_TANK_OPEN)
         self.handoff.close_old(SOURCE_TANK, DESTINATION_TANK)
+        self.machine.advance(STAGE_OLD_TANK_CLOSED)
         self.commit()
         return {"new_tank_id": SOURCE_TANK, "old_tank_id": DESTINATION_TANK}
 
     def retry_change_tank(self) -> dict[str, object]:
+        # Repair is only for a handover whose persist credential exists.
+        self.machine.require_fact(FACT_VALVE_PERSISTED)
         steps = self.handoff.retry(SOURCE_TANK, DESTINATION_TANK)
         self.commit()
         return {"steps": list(steps)}
@@ -564,6 +584,25 @@ class Services:
 
     # ------------------------------------------------------------- internal
 
+    def sequence_evidence(self) -> dict[str, bool]:
+        """Live gate facts derived from physical, durable evidence.
+
+        The persist fact needs a live valve-persist generation; the valve
+        facts need the actual field positions. Stage records never count as
+        evidence for another stage.
+        """
+
+        return {
+            FACT_VALVE_PERSISTED: self.generations.current(
+                SCOPE_VALVE_PERSIST, PERSIST_KEY
+            )
+            > 0,
+            FACT_NEW_TANK_OPEN: self.valves.position(VALVE_TANK_NEW)
+            == POSITION_OPEN,
+            FACT_OLD_TANK_CLOSED: self.valves.position(VALVE_TANK_OLD)
+            == POSITION_CLOSED,
+        }
+
     def _observe(self, record: Record) -> None:
         self.projection.apply(record)
 
@@ -607,6 +646,11 @@ class Services:
         self.valves.apply_positions(
             dict(self.projection.valve_positions), dict(self.projection.valve_ts)
         )
+        if self.projection.facts()[FACT_VALVE_PERSISTED]:
+            # Replayed valve positions below the watermark are durable writes.
+            for valve in self.valves.all():
+                if valve.valve_id in self.projection.valve_positions:
+                    valve.persisted = True
         self.header.restore(self.projection.header_setpoint)
         self.pumps.apply_running(dict(self.projection.pump_running))
         policy = ExpiryPolicy(self.settings.baseline_max_age)
@@ -643,6 +687,9 @@ class Services:
         for name, active in self.projection.latches.items():
             self.engine.restore(name, active, self.projection.latch_reason.get(name, ""))
         self.batches.restore(dict(self.projection.batches))
+        # Re-enter the sequence only from replayed stage records, and only if
+        # every gate along the way still has physical evidence behind it.
+        self.machine.restore(self.projection.stage, self.projection.stage_history)
 
 
 def build_services(

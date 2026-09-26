@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Mapping
 
 from tankfarm.event import topics
 from tankfarm.journal import TOMBSTONE_KIND
@@ -11,6 +11,8 @@ from tankfarm.sequence.stages import (
     FACT_NEW_TANK_OPEN,
     FACT_OLD_TANK_CLOSED,
     FACT_VALVE_PERSISTED,
+    STAGE_IDLE,
+    STAGE_ORDER,
 )
 from tankfarm.versioning.generation import (
     CONFIG_KEY,
@@ -43,6 +45,8 @@ class StateProjection:
         self.pressures: dict[str, float] = {}
         self.batches: dict[str, tuple[str, int]] = {}
         self.handoff_phase = ""
+        self.stage = STAGE_IDLE
+        self.stage_history: list[str] = [STAGE_IDLE]
         self.trips = 0
         self.tests = 0
         self.tombstones: list[int] = []
@@ -109,17 +113,29 @@ class StateProjection:
             self.settings = dict(payload["settings"])
             self.config_generation = int(payload["generation"])
             self._note_generation(SCOPE_CONFIG, CONFIG_KEY, payload, record.ts)
+        elif kind == topics.SEQUENCE_STAGE:
+            stage = str(payload["stage"])
+            self.stage = stage
+            self.stage_history.append(stage)
         elif kind == TOMBSTONE_KIND:
             self.tombstones.append(int(payload["target_seq"]))
         self.applied += 1
 
     def facts(self) -> dict[str, bool]:
+        """Gate facts derived strictly from replayed physical evidence.
+
+        A stage record is never evidence on its own: the persist fact needs
+        a durable valve-persist generation, and the two valve facts need the
+        corresponding valve positions actually present in the stream.
+        """
+
         return {
             FACT_VALVE_PERSISTED: bool(
                 self.generations.get((SCOPE_VALVE_PERSIST, PERSIST_KEY))
             ),
             FACT_NEW_TANK_OPEN: self.valve_positions.get("valve-tank-new") == "open",
-            FACT_OLD_TANK_CLOSED: self.valve_positions.get("valve-tank-old") != "open",
+            FACT_OLD_TANK_CLOSED: self.valve_positions.get("valve-tank-old")
+            == "closed",
         }
 
     def snapshot(self) -> dict[str, Any]:
@@ -140,6 +156,8 @@ class StateProjection:
             "pressures": dict(self.pressures),
             "batches": {key: list(value) for key, value in self.batches.items()},
             "handoff_phase": self.handoff_phase,
+            "stage": self.stage,
+            "stage_history": list(self.stage_history),
             "trips": self.trips,
             "tests": self.tests,
             "tombstones": list(self.tombstones),
@@ -205,6 +223,17 @@ class StateProjection:
             for key, value in payload.get("batches", {}).items()
         }
         projection.handoff_phase = str(payload.get("handoff_phase", ""))
+        raw_history = payload.get("stage_history")
+        if raw_history:
+            projection.stage_history = [str(item) for item in raw_history]
+            projection.stage = str(payload.get("stage", projection.stage_history[-1]))
+        else:
+            stage = str(payload.get("stage", STAGE_IDLE))
+            projection.stage = stage
+            if stage in STAGE_ORDER:
+                projection.stage_history = list(
+                    STAGE_ORDER[: STAGE_ORDER.index(stage) + 1]
+                )
         projection.trips = int(payload.get("trips", 0))
         projection.tests = int(payload.get("tests", 0))
         projection.tombstones = [int(item) for item in payload.get("tombstones", [])]
